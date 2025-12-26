@@ -1,0 +1,20 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+
+# Virtual environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Temp files
+*.log
+*.tmp
+
+# DO NOT exclude credentials.json and token.json
+# They are needed for Gmail OAuth in the container

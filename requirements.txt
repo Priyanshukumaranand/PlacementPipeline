@@ -4,6 +4,7 @@ uvicorn[standard]>=0.24.0
 
 # Database
 sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
 
 # Gmail API
 google-api-python-client>=2.100.0
