@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from app.api.v1.api import api_router
 from app.database import engine, Base
-from app.models import Email, PlacementDrive
+from app.models import Email, PlacementDrive, SyncState
 
 app = FastAPI(
     title="Placement Pipeline",

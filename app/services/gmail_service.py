@@ -135,3 +135,44 @@ def register_gmail_watch(service, project_id: str) -> dict:
     ).execute()
 
     return response
+
+
+def get_history_since(service, history_id: str) -> list:
+    """
+    Fetch all new message IDs since a given historyId.
+    
+    Uses Gmail History API for efficient incremental sync.
+    Only returns messages that were added (not modified/deleted).
+    
+    Args:
+        service: Authenticated Gmail API service
+        history_id: Starting point for history lookup
+        
+    Returns:
+        List of message IDs added since history_id
+    """
+    try:
+        results = service.users().history().list(
+            userId="me",
+            startHistoryId=history_id,
+            historyTypes=["messageAdded"],
+            labelIds=["INBOX"]
+        ).execute()
+        
+        messages = []
+        history = results.get("history", [])
+        
+        for record in history:
+            for msg in record.get("messagesAdded", []):
+                msg_id = msg["message"]["id"]
+                if msg_id not in messages:
+                    messages.append(msg_id)
+        
+        return messages
+        
+    except Exception as e:
+        # If history_id is too old, Gmail returns 404
+        # In this case, return empty and let caller handle
+        print(f"⚠️ History API error: {e}")
+        return []
+

@@ -1,6 +1,13 @@
-from fastapi import APIRouter
+"""
+Debug endpoints for testing Gmail integration and extraction pipeline.
+"""
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
 from app.services.gmail_service import get_gmail_service, get_full_message
 from app.services.email_extractor import extract_placement_info
+from app.services import db_service
+from app.database import get_db
 
 router = APIRouter(prefix="/debug", tags=["Debug"])
 
@@ -60,15 +67,18 @@ def test_gmail_read():
 
 
 @router.get("/gmail/extract")
-def extract_from_latest():
+def extract_from_latest(db: Session = Depends(get_db), batch_size: int = 50):
     """
-    Extract placement information from ALL emails sent by placement coordinators.
+    Extract placement information from ALL emails sent by placement coordinators
+    and SAVE them to the database.
 
-    Filters emails from specific senders, extracts structured placement data
-    including company name, batch, and dates. Only returns non-null values.
+    Uses pagination to avoid timeout. Run multiple times to process all emails.
+
+    Args:
+        batch_size: Number of emails to process per request (default 50)
 
     Returns:
-        list: Extracted placement information (excluding null/empty values)
+        dict: Summary of extraction with saved companies
     """
     # Get authenticated Gmail service
     service = get_gmail_service()
@@ -80,35 +90,175 @@ def extract_from_latest():
         "placement@iiit-bh.ac.in)"
     )
 
-    # Search for ALL messages matching the query (no maxResults limit)
+    # Search for messages matching the query
     results = service.users().messages().list(
         userId="me",
         q=query,
-        maxResults=500  # Increased to get more emails
+        maxResults=batch_size
     ).execute()
 
     messages = results.get("messages", [])
-    extracted = []
+    
+    emails_saved = 0
+    new_emails = 0
+    drives_saved = []
+    skipped = 0
 
     # Process each message
     for msg in messages:
+        msg_id = msg["id"]
+        
+        # Check if already processed
+        from app.models import Email
+        existing = db.query(Email).filter(Email.gmail_message_id == msg_id).first()
+        if existing:
+            skipped += 1
+            continue
+        
         # Get full message with body content
-        mail = get_full_message(service, msg["id"])
+        mail = get_full_message(service, msg_id)
+
+        # Save email to database
+        email = db_service.save_email(
+            db=db,
+            gmail_message_id=msg_id,
+            sender=mail["from"],
+            subject=mail["subject"],
+            raw_body=mail["body"]
+        )
+        new_emails += 1
+        emails_saved += 1
 
         # Extract placement information
         info = extract_placement_info(mail["subject"], mail["body"])
 
-        # Only include if extraction was successful AND has company name
+        # Only save if extraction was successful AND has company name
         if info and info.get("company"):
-            # Remove null values from the dictionary
-            cleaned_info = {k: v for k, v in info.items() if v is not None and v != [] and v != ""}
-
-            # Only add if we have meaningful data (at least company)
-            if cleaned_info:
-                extracted.append(cleaned_info)
+            drive = db_service.upsert_placement_drive(
+                db=db,
+                company_name=info["company"],
+                source_email_id=email.id,
+                role=info.get("role"),
+                batch=info.get("batch"),
+                official_source="TPO Email"
+            )
+            
+            if info["company"] not in drives_saved:
+                drives_saved.append(info["company"])
 
     return {
-        "total_scanned": len(messages),
-        "placements_found": len(extracted),
-        "data": extracted
+        "total_found": len(messages),
+        "already_processed": skipped,
+        "new_emails_saved": new_emails,
+        "placements_saved": len(drives_saved),
+        "companies": drives_saved
+    }
+
+
+@router.get("/db/stats")
+def get_db_stats(db: Session = Depends(get_db)):
+    """Get database statistics."""
+    from app.models import Email, PlacementDrive
+    
+    email_count = db.query(Email).count()
+    drive_count = db.query(PlacementDrive).count()
+    
+    # Get unique companies
+    companies = db.query(PlacementDrive.company_name).distinct().all()
+    
+    return {
+        "emails_stored": email_count,
+        "placement_drives": drive_count,
+        "unique_companies": [c[0] for c in companies]
+    }
+
+
+@router.get("/gmail/extract-all")
+def extract_all_emails(db: Session = Depends(get_db)):
+    """
+    Extract ALL placement emails with automatic pagination.
+    
+    This processes all emails from placement coordinators,
+    skipping already-processed ones.
+    """
+    service = get_gmail_service()
+    
+    query = (
+        "from:(navanita@iiit-bh.ac.in OR "
+        "rajashree@iiit-bh.ac.in OR "
+        "placement@iiit-bh.ac.in)"
+    )
+    
+    all_messages = []
+    page_token = None
+    
+    # Fetch all message IDs with pagination
+    print("📧 Fetching all placement emails...")
+    while True:
+        results = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=100,
+            pageToken=page_token
+        ).execute()
+        
+        messages = results.get("messages", [])
+        all_messages.extend(messages)
+        
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+    
+    print(f"📬 Found {len(all_messages)} total emails")
+    
+    # Process each message
+    from app.models import Email
+    new_emails = 0
+    drives_saved = []
+    
+    for i, msg in enumerate(all_messages):
+        msg_id = msg["id"]
+        
+        # Skip if already processed
+        existing = db.query(Email).filter(Email.gmail_message_id == msg_id).first()
+        if existing:
+            continue
+        
+        # Fetch and save
+        mail = get_full_message(service, msg_id)
+        
+        email = db_service.save_email(
+            db=db,
+            gmail_message_id=msg_id,
+            sender=mail["from"],
+            subject=mail["subject"],
+            raw_body=mail["body"]
+        )
+        new_emails += 1
+        
+        # Extract placement info
+        info = extract_placement_info(mail["subject"], mail["body"])
+        
+        if info and info.get("company"):
+            db_service.upsert_placement_drive(
+                db=db,
+                company_name=info["company"],
+                source_email_id=email.id,
+                role=info.get("role"),
+                batch=info.get("batch"),
+                official_source="TPO Email"
+            )
+            if info["company"] not in drives_saved:
+                drives_saved.append(info["company"])
+                print(f"   ✅ New company: {info['company']}")
+        
+        # Progress log every 10 emails
+        if (i + 1) % 10 == 0:
+            print(f"   Processed {i + 1}/{len(all_messages)}")
+    
+    return {
+        "total_emails_found": len(all_messages),
+        "new_emails_saved": new_emails,
+        "new_companies": len(drives_saved),
+        "companies": drives_saved
     }

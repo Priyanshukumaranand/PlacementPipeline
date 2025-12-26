@@ -16,6 +16,30 @@ from typing import Optional
 
 from app.models.email import Email
 from app.models.placement_drive import PlacementDrive
+from app.models.sync_state import SyncState
+
+
+# ============ SYNC STATE OPERATIONS ============
+
+def get_sync_state(db: Session, key: str) -> Optional[str]:
+    """Get a sync state value by key."""
+    state = db.query(SyncState).filter(SyncState.key == key).first()
+    return state.value if state else None
+
+
+def set_sync_state(db: Session, key: str, value: str) -> SyncState:
+    """Set a sync state value (upsert)."""
+    state = db.query(SyncState).filter(SyncState.key == key).first()
+    
+    if state:
+        state.value = value
+    else:
+        state = SyncState(key=key, value=value)
+        db.add(state)
+    
+    db.commit()
+    db.refresh(state)
+    return state
 
 
 # ============ EMAIL OPERATIONS ============
