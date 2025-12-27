@@ -66,6 +66,32 @@ def test_gmail_read():
     }
 
 
+@router.get("/gmail/sample")
+def get_sample_email(db: Session = Depends(get_db)):
+    """
+    Get one sample email to see the full data structure.
+    
+    This is for TESTING ONLY - shows how email data is stored.
+    Returns the first email from the database with full body content.
+    """
+    from app.models import Email
+    
+    email = db.query(Email).first()
+    if not email:
+        return {"error": "No emails stored in database"}
+    
+    return {
+        "id": email.id,
+        "gmail_message_id": email.gmail_message_id,
+        "sender": email.sender,
+        "subject": email.subject,
+        "raw_body": email.raw_body[:3000] + "..." if email.raw_body and len(email.raw_body) > 3000 else email.raw_body,
+        "body_length": len(email.raw_body) if email.raw_body else 0,
+        "created_at": email.created_at.isoformat() if email.created_at else None
+    }
+
+
+
 @router.get("/gmail/extract")
 def extract_from_latest(db: Session = Depends(get_db), batch_size: int = 50):
     """
@@ -157,7 +183,7 @@ def extract_from_latest(db: Session = Depends(get_db), batch_size: int = 50):
 
 @router.get("/db/stats")
 def get_db_stats(db: Session = Depends(get_db)):
-    """Get database statistics."""
+    """Get database statistics with full drive details for dashboard."""
     from app.models import Email, PlacementDrive
     
     email_count = db.query(Email).count()
@@ -166,10 +192,27 @@ def get_db_stats(db: Session = Depends(get_db)):
     # Get unique companies
     companies = db.query(PlacementDrive.company_name).distinct().all()
     
+    # Get full drive details for scatter plot, ordered by created_at
+    drives = db.query(PlacementDrive).order_by(PlacementDrive.created_at.asc()).all()
+    
+    drives_data = []
+    for drive in drives:
+        drives_data.append({
+            "id": drive.id,
+            "company_name": drive.company_name,
+            "role": drive.role,
+            "ctc_or_stipend": drive.ctc_or_stipend,
+            "drive_date": drive.drive_date.isoformat() if drive.drive_date else None,
+            "created_at": drive.created_at.isoformat() if drive.created_at else None,
+            "status": drive.status,
+            "batch": drive.batch
+        })
+    
     return {
         "emails_stored": email_count,
         "placement_drives": drive_count,
-        "unique_companies": [c[0] for c in companies]
+        "unique_companies": [c[0] for c in companies],
+        "drives": drives_data
     }
 
 
