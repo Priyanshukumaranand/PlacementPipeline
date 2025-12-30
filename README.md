@@ -89,6 +89,38 @@ erDiagram
     }
 ```
 
+### 🧠 Intelligence Pipeline (LangGraph)
+
+The system uses a 10-step **LangGraph** pipeline to transform raw emails into structured data.
+
+```mermaid
+graph TD
+    Start([Input]) --> Filter
+    Filter --> Clean
+    Clean --> Noise
+    Noise --> Token
+    Token --> Sections
+    Sections --> Regex
+    Regex --> AI
+    AI --> Validate
+    Validate --> Dedup
+    Dedup --> Map
+    Map --> End([Output])
+```
+
+| Node | Function | How it works |
+|:---|:---|:---|
+| **1. filter_sender** | Security Gate | • Checks sender against `ALLOWED_SENDERS` (TPO emails).<br>• Scans subject for keywords (Drive, Hiring, Intern). |
+| **2. html_to_text** | Normalization | • Uses `BeautifulSoup` to strip HTML tags.<br>• Preserves line breaks for structure. |
+| **3. remove_noise** | Scrubber | • Cuts email signatures, "Forwarded message" headers, and legal disclaimers using Regex markers. |
+| **4. token_safety** | Constraint | • Truncates body to ~12k chars (~3k tokens) to ensure it fits within Gemini's context window. |
+| **5. extract_sections**| Segmentation| • Heuristic search for "Eligibility", "Process", "Dates" headers to focus extraction. |
+| **6. regex_extract** | Pattern Matching| • Runs 20+ regex patterns for Batch (e.g., `202[4-6]`), CTC (`\d+\.?\d* LPA`), and Roles. |
+| **7. gemini_enhance** | AI Intelligence | • Sends cleaned text + regex hints to **Gemini 1.5 Flash**.<br>• Fills gaps (e.g., implied roles, complex eligibility). |
+| **8. validation** | Data Integrity | • Standardizes dates to `YYYY-MM-DD`.<br>• Ensures strings like "8 LPA" become floats like `8.0`. |
+| **9. deduplication** | Conflict Check | • Fuzzy matches `(Company, Batch, Role)` against the DB.<br>• Prevents duplicate entries for the same drive. |
+| **10. map_to_model** | Formatting | • Maps the validated dictionary to the SQLAlchemy `PlacementDrive` schema fields. |
+
 ---
 
 ## 🚀 Quick Start
