@@ -184,3 +184,110 @@ def get_filter_options(db: Session = Depends(get_db)):
         statuses=["upcoming", "open", "closed", "cancelled"],
         drive_types=["internship", "fte", "both"]
     )
+
+
+# ============ STATS & SUMMARY ============
+
+@router.get("/stats/summary")
+def get_placement_stats(db: Session = Depends(get_db)):
+    """
+    Get comprehensive placement statistics and summary.
+    
+    Returns:
+    - Total companies
+    - Breakdown by batch, status, location
+    - Top CTC ranges
+    - Recent drives
+    """
+    from app.models import PlacementDrive
+    from sqlalchemy import func
+    
+    # Total companies
+    total = db.query(PlacementDrive).count()
+    
+    # By batch
+    by_batch = db.query(
+        PlacementDrive.batch, 
+        func.count(PlacementDrive.id)
+    ).group_by(PlacementDrive.batch).all()
+    
+    # By status
+    by_status = db.query(
+        PlacementDrive.status,
+        func.count(PlacementDrive.id)
+    ).group_by(PlacementDrive.status).all()
+    
+    # By location
+    by_location = db.query(
+        PlacementDrive.job_location,
+        func.count(PlacementDrive.id)
+    ).filter(PlacementDrive.job_location.isnot(None)).group_by(
+        PlacementDrive.job_location
+    ).order_by(func.count(PlacementDrive.id).desc()).limit(10).all()
+    
+    # Recent 10 companies
+    recent = db.query(PlacementDrive).order_by(
+        PlacementDrive.id.desc()
+    ).limit(10).all()
+    
+    return {
+        "total_companies": total,
+        "by_batch": {b[0]: b[1] for b in by_batch if b[0]},
+        "by_status": {s[0]: s[1] for s in by_status if s[0]},
+        "top_locations": {l[0]: l[1] for l in by_location if l[0]},
+        "recent_companies": [
+            {
+                "id": d.id,
+                "company_name": d.company_name,
+                "role": d.role,
+                "ctc_or_stipend": d.ctc_or_stipend,
+                "eligible_branches": d.eligible_branches,
+                "job_location": d.job_location
+            }
+            for d in recent
+        ]
+    }
+
+
+@router.get("/all/detailed")
+def get_all_drives_detailed(
+    batch: Optional[str] = Query(None, description="Filter by batch"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all placement drives with full details.
+    
+    Returns every field for each drive in a flat list.
+    Useful for frontend to display complete placement data.
+    """
+    from app.models import PlacementDrive
+    
+    query = db.query(PlacementDrive)
+    if batch:
+        query = query.filter(PlacementDrive.batch == batch)
+    
+    drives = query.order_by(PlacementDrive.company_name).all()
+    
+    return {
+        "total": len(drives),
+        "batch_filter": batch,
+        "drives": [
+            {
+                "id": d.id,
+                "company_name": d.company_name,
+                "role": d.role,
+                "drive_type": d.drive_type,
+                "drive_date": d.drive_date.isoformat() if d.drive_date else None,
+                "registration_deadline": d.registration_deadline.isoformat() if d.registration_deadline else None,
+                "eligible_branches": d.eligible_branches,
+                "min_cgpa": d.min_cgpa,
+                "ctc_or_stipend": d.ctc_or_stipend,
+                "job_location": d.job_location,
+                "registration_link": d.registration_link,
+                "confidence_score": d.confidence_score,
+                "official_source": d.official_source
+            }
+            for d in drives
+        ]
+    }
+

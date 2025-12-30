@@ -52,7 +52,7 @@ class PlacementDrive(Base):
     company_logo = Column(String(512))  # URL to logo image
     
     # ============ ROLE & TYPE ============
-    role = Column(String(255))  # e.g., "SDE Intern", "Full Stack Developer"
+    role = Column(String(255))  # e.g., "SDE Intern" or "SDE, Data Analyst" for multiple
     drive_type = Column(String(50))  # "internship", "fte", "both"
     
     # ============ TARGETING ============
