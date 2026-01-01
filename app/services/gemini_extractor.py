@@ -39,10 +39,27 @@ EXTRACTION_SCHEMA = {
     "registration_link": "url|null",
 }
 
-EXTRACTION_PROMPT = """Extract placement info. Only explicit data, null if missing. JSON only.
+EXTRACTION_PROMPT = """You are an expert at extracting structured placement drive information from emails.
+
+Extract ONLY explicit information from the email. Use null for any missing fields. Return valid JSON only.
 
 Subject: {subject}
 Email: {email_content}
+
+Extraction Rules:
+1. company_name: Extract the company name from subject or body. Clean up suffixes like "Pvt Ltd", "Inc", etc.
+2. role: Job roles/positions (e.g., "SDE Intern", "Software Engineer"). Use comma-separated if multiple.
+3. drive_type: "internship", "fte", or "both" based on what's mentioned.
+4. batch: Target graduation year (e.g., "2025", "2026", "2027").
+5. drive_date: When the drive/interview happens (YYYY-MM-DD format).
+6. registration_deadline: Last date to apply/register (YYYY-MM-DD format).
+7. eligible_branches: Branch codes like "CSE, IT, ECE" or "All Branches".
+8. min_cgpa: Minimum CGPA requirement as a number (e.g., 7.0, 8.5).
+9. ctc_or_stipend: Compensation in format like "₹12 LPA" or "₹40,000/month".
+10. job_location: City name or "Remote" or "Hybrid".
+11. registration_link: Full URL to application/registration form.
+
+Return JSON with these fields. Use null for missing values.
 
 Fields: {schema}"""
 

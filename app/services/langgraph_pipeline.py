@@ -15,6 +15,7 @@ Implements the 10-step pipeline:
 """
 
 from typing import TypedDict, List, Dict, Any, Optional
+import re
 from langgraph.graph import StateGraph, START, END
 
 from app.services.text_cleaner import (
@@ -74,9 +75,26 @@ class PipelineState(TypedDict):
 # ============ NODE FUNCTIONS ============
 
 def filter_sender_node(state: PipelineState) -> dict:
-    """Node 1: Filter by allowed senders AND campus drive keywords in subject."""
+    """
+    Node 1: Filter by allowed senders AND placement-related keywords.
+    
+    Improved detection:
+    - Checks sender domain (more flexible)
+    - Checks subject AND body preview for placement keywords
+    - More comprehensive keyword list
+    """
     sender_lower = state["sender"].lower()
-    is_allowed = any(allowed in sender_lower for allowed in ALLOWED_SENDERS)
+    
+    # More flexible sender check - check domain too
+    sender_email = sender_lower.split('<')[-1].split('>')[0].strip()  # Extract email from "Name <email>"
+    is_allowed = any(
+        allowed in sender_lower or allowed in sender_email 
+        for allowed in ALLOWED_SENDERS
+    )
+    
+    # Also check if it's from iiit-bh.ac.in domain (TPO emails)
+    if not is_allowed and '@iiit-bh.ac.in' in sender_email:
+        is_allowed = True
     
     if not is_allowed:
         return {
@@ -85,18 +103,53 @@ def filter_sender_node(state: PipelineState) -> dict:
             "error_message": f"Sender not allowed: {state['sender']}"
         }
     
-    # Check if subject contains campus/recruitment drive keywords
+    # Check subject AND body preview for placement keywords
     subject_lower = state.get("subject", "").lower()
-    drive_keywords = ["campus drive", "recruitment drive", "campus recruitment", 
-                      "placement drive", "pool campus", "hiring drive",
-                      "internship drive", "fte drive", "online test"]
-    is_drive_email = any(kw in subject_lower for kw in drive_keywords)
+    body_preview = (state.get("raw_body", "")[:500] or "").lower()  # First 500 chars
+    combined_text = f"{subject_lower} {body_preview}"
+    
+    # Comprehensive placement keywords
+    drive_keywords = [
+        # Direct drive mentions
+        "campus drive", "recruitment drive", "campus recruitment", 
+        "placement drive", "pool campus", "hiring drive",
+        "internship drive", "fte drive", "full time drive",
+        # Company/opportunity mentions
+        "campus hiring", "off campus", "on campus", "placement opportunity",
+        "job opportunity", "internship opportunity", "recruitment",
+        # Process mentions
+        "online test", "aptitude test", "coding test", "technical test",
+        "interview", "shortlisting", "selection process",
+        # Registration/application
+        "registration", "apply", "application", "deadline",
+        # Company-specific patterns
+        "company visit", "company drive", "company recruitment",
+        # Batch/year mentions (often in placement emails)
+        "batch 202", "passing out", "graduating batch"
+    ]
+    
+    # Check if any keyword appears
+    is_drive_email = any(kw in combined_text for kw in drive_keywords)
+    
+    # Additional check: Look for company name patterns in subject
+    # Pattern: "Company Name Campus Drive" or "Campus Drive || Company"
+    company_patterns = [
+        r'\|\|\s*[A-Z][A-Za-z0-9\s&.]+?\s*(?:\|\||$)',  # || Company Name ||
+        r'^[A-Z][A-Za-z0-9\s&.]+?\s+(?:Campus|Placement|Recruitment|Internship)',  # Company at start
+        r'(?:Drive|Recruitment|Placement)\s*[:\-]\s*[A-Z][A-Za-z0-9\s&.]+',  # Drive: Company
+    ]
+    
+    has_company_pattern = any(re.search(pattern, subject_lower) for pattern in company_patterns)
+    
+    # If we have company pattern, it's likely a placement email
+    if has_company_pattern:
+        is_drive_email = True
     
     if not is_drive_email:
         return {
             "is_allowed_sender": True,
             "status": "filtered",
-            "error_message": f"Not a campus drive email: {state.get('subject', '')[:50]}"
+            "error_message": f"Not a placement email: {state.get('subject', '')[:50]}"
         }
     
     return {
