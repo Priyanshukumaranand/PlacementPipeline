@@ -25,6 +25,7 @@ httpx>=0.25.0
 
 # Gemini AI for extraction
 google-genai>=1.0.0
+langchain-google-genai>=2.0.0
 
 # LangGraph for pipeline orchestration
 langgraph>=0.2.0

@@ -1,9 +1,6 @@
 """
 Google OAuth authentication endpoints for Gmail API access.
 
-These endpoints handle the OAuth flow for deployed environments where
-browser-based authentication isn't possible.
-
 Flow:
 1. GET /auth/login -> Redirects to Google OAuth consent screen
 2. Google redirects back to /auth/callback with code
@@ -15,8 +12,33 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
+from pydantic import BaseModel
 import os
-import json
+
+
+# Response Models
+class AuthStatusResponse(BaseModel):
+    """Authentication status check response."""
+    authenticated: bool
+    expired: bool
+    has_refresh_token: bool
+    message: str
+
+
+class AuthSuccessResponse(BaseModel):
+    """Successful authentication response."""
+    success: bool
+    message: str
+    token_saved: str | None = None
+    has_refresh_token: bool = False
+
+
+class AuthErrorResponse(BaseModel):
+    """Authentication error response."""
+    success: bool = False
+    error: str
+    message: str
+
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -44,25 +66,18 @@ def get_oauth_flow(redirect_uri: str) -> Flow:
     return flow
 
 
-@router.get("/status")
-def auth_status():
-    """
-    Check current authentication status.
-    
-    Returns:
-    - authenticated: Whether valid credentials exist
-    - expired: Whether the token is expired
-    - has_refresh_token: Whether automatic refresh is possible
-    """
+@router.get("/status", response_model=AuthStatusResponse)
+def auth_status() -> AuthStatusResponse:
+    """Check current authentication status."""
     token_file = os.getenv("GOOGLE_TOKEN_FILE", "token.json")
     
     if not os.path.exists(token_file):
-        return {
-            "authenticated": False,
-            "expired": True,
-            "has_refresh_token": False,
-            "message": "No token found. Please sign in."
-        }
+        return AuthStatusResponse(
+            authenticated=False,
+            expired=True,
+            has_refresh_token=False,
+            message="No token found. Please sign in."
+        )
     
     try:
         creds = Credentials.from_authorized_user_file(token_file, SCOPES)
