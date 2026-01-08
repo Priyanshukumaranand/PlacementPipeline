@@ -138,34 +138,8 @@ def list_drives(
     )
 
 
-# ============ SINGLE DRIVE ============
-
-@router.get("/{drive_id}", response_model=DriveFullResponse)
-def get_drive(drive_id: int, db: Session = Depends(get_db)):
-    """
-    Get a single placement drive by ID (expanded view).
-    
-    Returns all fields including eligibility, CTC, location, etc.
-    
-    **Path Parameters:**
-    - `drive_id`: The ID of the placement drive
-    
-    **Returns:**
-    - 200: Complete drive details
-    - 404: Drive not found
-    """
-    drive = db_service.get_drive_by_id(db, drive_id)
-    
-    if not drive:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Placement drive with ID {drive_id} not found"
-        )
-    
-    return drive
-
-
 # ============ FILTER OPTIONS ============
+# NOTE: Static routes MUST be defined BEFORE dynamic routes like /{drive_id}
 
 @router.get("/filters/options", response_model=FiltersResponse)
 def get_filter_options(db: Session = Depends(get_db)):
@@ -290,4 +264,32 @@ def get_all_drives_detailed(
             for d in drives
         ]
     }
+
+
+# ============ SINGLE DRIVE ============
+# NOTE: This dynamic route MUST be defined AFTER all static routes
+
+@router.get("/{drive_id}", response_model=DriveFullResponse)
+def get_drive(drive_id: int, db: Session = Depends(get_db)):
+    """
+    Get a single placement drive by ID (expanded view).
+    
+    Returns all fields including eligibility, CTC, location, etc.
+    
+    **Path Parameters:**
+    - `drive_id`: The ID of the placement drive
+    
+    **Returns:**
+    - 200: Complete drive details
+    - 404: Drive not found
+    """
+    drive = db_service.get_drive_by_id(db, drive_id)
+    
+    if not drive:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Placement drive with ID {drive_id} not found"
+        )
+    
+    return drive
 

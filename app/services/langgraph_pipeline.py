@@ -1,29 +1,22 @@
 """
-LangGraph Email Processing Pipeline.
+LangGraph Email Processing Pipeline (Refactored).
 
-Implements the 10-step pipeline:
-1. Filter Sender → Only TPO coordinators
-2. HTML → Text → Clean HTML to plain text  
-3. Remove Noise → Signatures, disclaimers, replies
-4. Token Trim → Limit to ~3000 tokens
-5. Extract Sections → URLs, dates, numbers
-6. Regex Extract → Pattern-based field extraction
-7. Gemini Enhance → Optional AI enhancement
-8. Validate → Normalize and verify data
-9. Dedup Check → Prevent duplicates
-10. Map to Model → PlacementDrive fields
+Streamlined 6-node pipeline with conditional routing:
+1. Filter Sender → Only TPO emails about placements
+2. Process Text → HTML→Text, noise removal, token trim, extract sections
+3. Extract & Validate → Regex + Gemini extraction + validation
+4. Deduplicate → Check for existing drives
+5. Save to DB → Persist email and drive
+6. END
 """
 
 from typing import TypedDict, List, Dict, Any, Optional
-import re
+from datetime import datetime
+import os
 from langgraph.graph import StateGraph, START, END
+from sqlalchemy.orm import Session
 
-from app.services.text_cleaner import (
-    html_to_text,
-    remove_noise,
-    trim_to_token_limit,
-    extract_important_sections
-)
+from app.services.text_cleaner import process_email_text
 from app.services.regex_extractor import extract_all_fields
 from app.services.gemini_extractor import (
     extract_with_gemini,
@@ -31,11 +24,21 @@ from app.services.gemini_extractor import (
     check_duplicate
 )
 
-# Allowed senders - ONLY process emails from these
+# Allowed senders
 ALLOWED_SENDERS = [
     'navanita@iiit-bh.ac.in',
     'rajashree@iiit-bh.ac.in',
     'placement@iiit-bh.ac.in',
+]
+
+# Placement keywords
+PLACEMENT_KEYWORDS = [
+    "campus drive", "recruitment drive", "campus recruitment",
+    "placement drive", "pool campus", "hiring drive",
+    "internship drive", "fte drive", "full time drive",
+    "campus hiring", "off campus", "on campus", "placement opportunity",
+    "online test", "aptitude test", "coding test", "technical test",
+    "company visit", "company drive", "batch 202", "passing out"
 ]
 
 
@@ -48,352 +51,230 @@ class PipelineState(TypedDict):
     subject: str
     raw_body: str
     
-    # Processing outputs
-    is_allowed_sender: bool
-    plain_text: str
+    # Processing
     clean_text: str
-    trimmed_text: str
     excerpts: List[str]
     
-    # Extraction outputs
-    regex_data: Dict[str, Any]      # From regex extraction
-    gemini_data: Dict[str, Any]     # From Gemini (if available)
-    extracted_data: Dict[str, Any]  # Merged result
-    validated_data: Dict[str, Any]  # After validation
+    # Extraction
+    extracted_data: Dict[str, Any]
     
     # Status
-    status: str
-    is_duplicate: bool
+    status: str  # pending, filtered, extracted, duplicate, saved, failed
     error_message: Optional[str]
     
     # Config
     api_key: Optional[str]
     use_gemini: bool
     existing_drives: List[Dict]
+    
+    # Database (optional, for internal save)
+    db: Optional[Any]
+    saved_email_id: Optional[int]
+    saved_drive_id: Optional[int]
 
 
 # ============ NODE FUNCTIONS ============
 
 def filter_sender_node(state: PipelineState) -> dict:
-    """
-    Node 1: Filter by allowed senders AND placement-related keywords.
-    
-    Improved detection:
-    - Checks sender domain (more flexible)
-    - Checks subject AND body preview for placement keywords
-    - More comprehensive keyword list
-    """
+    """Node 1: Filter by sender AND placement keywords."""
     sender_lower = state["sender"].lower()
+    sender_email = sender_lower.split('<')[-1].split('>')[0].strip()
     
-    # More flexible sender check - check domain too
-    sender_email = sender_lower.split('<')[-1].split('>')[0].strip()  # Extract email from "Name <email>"
-    is_allowed = any(
-        allowed in sender_lower or allowed in sender_email 
-        for allowed in ALLOWED_SENDERS
+    # Check sender
+    is_allowed = (
+        any(allowed in sender_lower or allowed in sender_email for allowed in ALLOWED_SENDERS)
+        or '@iiit-bh.ac.in' in sender_email
     )
     
-    # Also check if it's from iiit-bh.ac.in domain (TPO emails)
-    if not is_allowed and '@iiit-bh.ac.in' in sender_email:
-        is_allowed = True
-    
     if not is_allowed:
-        return {
-            "is_allowed_sender": False,
-            "status": "filtered",
-            "error_message": f"Sender not allowed: {state['sender']}"
-        }
+        return {"status": "filtered", "error_message": f"Sender not allowed: {state['sender']}"}
     
-    # Check subject AND body preview for placement keywords
-    subject_lower = state.get("subject", "").lower()
-    body_preview = (state.get("raw_body", "")[:500] or "").lower()  # First 500 chars
-    combined_text = f"{subject_lower} {body_preview}"
+    # Check placement keywords
+    combined = f"{state.get('subject', '').lower()} {(state.get('raw_body', '')[:500] or '').lower()}"
+    if not any(kw in combined for kw in PLACEMENT_KEYWORDS):
+        return {"status": "filtered", "error_message": f"Not a placement email: {state.get('subject', '')[:50]}"}
     
-    # Comprehensive placement keywords
-    drive_keywords = [
-        # Direct drive mentions
-        "campus drive", "recruitment drive", "campus recruitment", 
-        "placement drive", "pool campus", "hiring drive",
-        "internship drive", "fte drive", "full time drive",
-        # Company/opportunity mentions
-        "campus hiring", "off campus", "on campus", "placement opportunity",
-        "job opportunity", "internship opportunity", "recruitment",
-        # Process mentions
-        "online test", "aptitude test", "coding test", "technical test",
-        "interview", "shortlisting", "selection process",
-        # Registration/application
-        "registration", "apply", "application", "deadline",
-        # Company-specific patterns
-        "company visit", "company drive", "company recruitment",
-        # Batch/year mentions (often in placement emails)
-        "batch 202", "passing out", "graduating batch"
-    ]
-    
-    # Check if any keyword appears
-    is_drive_email = any(kw in combined_text for kw in drive_keywords)
-    
-    # Additional check: Look for company name patterns in subject
-    # Pattern: "Company Name Campus Drive" or "Campus Drive || Company"
-    company_patterns = [
-        r'\|\|\s*[A-Z][A-Za-z0-9\s&.]+?\s*(?:\|\||$)',  # || Company Name ||
-        r'^[A-Z][A-Za-z0-9\s&.]+?\s+(?:Campus|Placement|Recruitment|Internship)',  # Company at start
-        r'(?:Drive|Recruitment|Placement)\s*[:\-]\s*[A-Z][A-Za-z0-9\s&.]+',  # Drive: Company
-    ]
-    
-    has_company_pattern = any(re.search(pattern, subject_lower) for pattern in company_patterns)
-    
-    # If we have company pattern, it's likely a placement email
-    if has_company_pattern:
-        is_drive_email = True
-    
-    if not is_drive_email:
-        return {
-            "is_allowed_sender": True,
-            "status": "filtered",
-            "error_message": f"Not a placement email: {state.get('subject', '')[:50]}"
-        }
-    
-    return {
-        "is_allowed_sender": True,
-        "status": "pending"
-    }
+    return {"status": "pending"}
 
 
-def html_to_text_node(state: PipelineState) -> dict:
-    """Node 2: Convert HTML to plain text."""
-    if state.get("status") == "filtered":
-        return {}
-    
+def process_text_node(state: PipelineState) -> dict:
+    """Node 2: Full text processing (HTML→Text, noise, trim, excerpts)."""
     try:
-        plain_text = html_to_text(state["raw_body"])
-        return {"plain_text": plain_text}
+        _, clean_text, excerpts = process_email_text(state["raw_body"])
+        return {"clean_text": clean_text, "excerpts": excerpts}
     except Exception as e:
-        return {
-            "status": "failed",
-            "error_message": f"HTML conversion failed: {str(e)}"
-        }
+        return {"status": "failed", "error_message": f"Text processing failed: {e}"}
 
 
-def remove_noise_node(state: PipelineState) -> dict:
-    """Node 3: Remove signatures, disclaimers, reply history."""
-    if state.get("status") in ["filtered", "failed"]:
-        return {}
-    
+def extract_and_validate_node(state: PipelineState) -> dict:
+    """Node 3: Extract fields (regex + optional Gemini) and validate."""
     try:
-        clean_text = remove_noise(state.get("plain_text", ""))
-        return {"clean_text": clean_text}
-    except Exception as e:
-        return {
-            "status": "failed",
-            "error_message": f"Noise removal failed: {str(e)}"
-        }
-
-
-def token_safety_node(state: PipelineState) -> dict:
-    """Node 4: Trim to ~3000 tokens."""
-    if state.get("status") in ["filtered", "failed"]:
-        return {}
-    
-    try:
-        trimmed_text = trim_to_token_limit(state.get("clean_text", ""), max_chars=12000)
-        return {
-            "trimmed_text": trimmed_text,
-            "status": "cleaned"
-        }
-    except Exception as e:
-        return {
-            "status": "failed",
-            "error_message": f"Token trimming failed: {str(e)}"
-        }
-
-
-def extract_sections_node(state: PipelineState) -> dict:
-    """Node 5: Extract important sections (URLs, dates)."""
-    if state.get("status") in ["filtered", "failed"]:
-        return {}
-    
-    try:
-        excerpts_str, excerpts_list = extract_important_sections(state.get("clean_text", ""))
-        return {"excerpts": excerpts_list}
-    except Exception:
-        return {"excerpts": []}
-
-
-def regex_extract_node(state: PipelineState) -> dict:
-    """Node 6: Regex-based field extraction (ALWAYS runs)."""
-    if state.get("status") in ["filtered", "failed"]:
-        return {}
-    
-    try:
-        regex_data = extract_all_fields(
-            text=state.get("trimmed_text", ""),
+        # Regex extraction (always)
+        data = extract_all_fields(
+            text=state.get("clean_text", ""),
             subject=state.get("subject", "")
         )
+        
+        # Gemini enhancement (if enabled)
+        api_key = state.get("api_key") or os.getenv("GOOGLE_API_KEY")
+        if state.get("use_gemini", True) and api_key:
+            try:
+                excerpts_text = "\n".join(state.get("excerpts", []))
+                llm_input = f"EXTRACTED:\n{excerpts_text}\n\nEMAIL:\n{state.get('clean_text', '')}"
+                gemini_data = extract_with_gemini(llm_input, state.get("subject", ""), api_key)
+                
+                # Merge: Gemini fills gaps
+                for k, v in gemini_data.items():
+                    if v is not None and k not in ["extraction_error", "confidence_score"]:
+                        data[k] = v
+                if not gemini_data.get("extraction_error"):
+                    data["confidence_score"] = max(data.get("confidence_score", 0), gemini_data.get("confidence_score", 0))
+                    data["extraction_method"] = "regex+gemini"
+            except Exception:
+                pass  # Gemini failed, use regex data
+        
+        # Validate
+        validated = validate_extracted_data(data)
+        
+        # Set defaults
+        if not validated.get("status"):
+            validated["status"] = "upcoming"
+        if not validated.get("official_source"):
+            validated["official_source"] = "TPO Email"
+        
         return {
-            "regex_data": regex_data,
-            "extracted_data": regex_data.copy(),  # Use as base
-            "status": "extracted"
+            "extracted_data": validated,
+            "status": "needs_review" if validated.get("needs_review") else "extracted"
         }
     except Exception as e:
-        return {
-            "status": "failed",
-            "error_message": f"Regex extraction failed: {str(e)}"
-        }
-
-
-def gemini_enhance_node(state: PipelineState) -> dict:
-    """Node 7: Optional Gemini enhancement (if enabled and API key available)."""
-    if state.get("status") in ["filtered", "failed"]:
-        return {}
-    
-    # Skip if Gemini not requested
-    if not state.get("use_gemini", True):
-        return {}
-    
-    api_key = state.get("api_key")
-    if not api_key:
-        return {}  # Silently skip, regex data is already there
-    
-    try:
-        # Build LLM input with excerpts
-        excerpts = state.get("excerpts", [])
-        excerpts_text = "\n".join(excerpts) if excerpts else ""
-        llm_input = f"EXTRACTED INFO:\n{excerpts_text}\n\nEMAIL:\n{state.get('trimmed_text', '')}"
-        
-        gemini_data = extract_with_gemini(
-            email_content=llm_input,
-            subject=state.get("subject", ""),
-            api_key=api_key
-        )
-        
-        # Merge with regex data (Gemini overrides nulls)
-        merged = state.get("extracted_data", {}).copy()
-        for key, value in gemini_data.items():
-            if value is not None and key not in ["extraction_error", "confidence_score"]:
-                merged[key] = value
-        
-        # Higher confidence if Gemini succeeded
-        if not gemini_data.get("extraction_error"):
-            merged["confidence_score"] = max(
-                merged.get("confidence_score", 0),
-                gemini_data.get("confidence_score", 0)
-            )
-            merged["extraction_method"] = "regex+gemini"
-        
-        return {
-            "gemini_data": gemini_data,
-            "extracted_data": merged
-        }
-    except Exception:
-        # Gemini failed, but regex data still valid
-        return {}
-
-
-def validation_node(state: PipelineState) -> dict:
-    """Node 8: Validate and normalize extracted data."""
-    if state.get("status") in ["filtered", "failed"]:
-        return {}
-    
-    try:
-        validated = validate_extracted_data(state.get("extracted_data", {}))
-        status = "needs_review" if validated.get("needs_review") else "validated"
-        
-        return {
-            "validated_data": validated,
-            "status": status
-        }
-    except Exception as e:
-        return {
-            "status": "failed",
-            "error_message": f"Validation failed: {str(e)}"
-        }
+        return {"status": "failed", "error_message": f"Extraction failed: {e}"}
 
 
 def deduplication_node(state: PipelineState) -> dict:
-    """Node 9: Check for duplicates."""
-    if state.get("status") in ["filtered", "failed"]:
-        return {}
-    
+    """Node 4: Check for duplicates."""
     try:
         is_dup = check_duplicate(
-            state.get("validated_data", {}),
+            state.get("extracted_data", {}),
             state.get("existing_drives", [])
         )
-        
         if is_dup:
-            return {
-                "is_duplicate": True,
-                "status": "duplicate"
-            }
-        return {"is_duplicate": False}
-    except Exception:
-        return {"is_duplicate": False}
-
-
-def map_to_model_node(state: PipelineState) -> dict:
-    """Node 10: Map to PlacementDrive model fields."""
-    if state.get("status") in ["filtered", "failed", "duplicate"]:
+            return {"status": "duplicate"}
         return {}
+    except Exception:
+        return {}
+
+
+def save_to_db_node(state: PipelineState) -> dict:
+    """Node 5: Save email and drive to database (if db session provided)."""
+    db = state.get("db")
+    if not db:
+        return {"status": "ready"}  # No DB, just return ready
     
-    model_fields = [
-        "company_name", "company_logo", "role", "drive_type", "batch",
-        "drive_date", "registration_deadline", "eligible_branches",
-        "min_cgpa", "eligibility_text", "ctc_or_stipend", "job_location",
-        "registration_link", "status", "confidence_score", "official_source"
-    ]
-    
-    validated = state.get("validated_data", {})
-    placement_dict = {}
-    
-    for field in model_fields:
-        placement_dict[field] = validated.get(field)
-    
-    # Set defaults
-    if not placement_dict.get("status"):
-        placement_dict["status"] = "upcoming"
-    if not placement_dict.get("official_source"):
-        placement_dict["official_source"] = "TPO Email"
-    
-    return {
-        "validated_data": placement_dict,
-        "status": "ready"
-    }
+    try:
+        from app.services import db_service
+        
+        validated = state.get("extracted_data", {})
+        if not validated.get("company_name"):
+            return {"status": "ready", "error_message": "No company extracted"}
+        
+        # Save email
+        email = db_service.save_email(
+            db=db,
+            gmail_message_id=state["gmail_message_id"],
+            sender=state["sender"],
+            subject=state["subject"],
+            raw_body=state["raw_body"]
+        )
+        
+        # Parse dates
+        drive_date = validated.get("drive_date")
+        reg_deadline = validated.get("registration_deadline")
+        
+        if isinstance(drive_date, str):
+            try:
+                drive_date = datetime.fromisoformat(drive_date.replace('Z', '+00:00')).date()
+            except:
+                drive_date = None
+        elif drive_date and isinstance(drive_date, datetime):
+            drive_date = drive_date.date()
+        
+        if isinstance(reg_deadline, str):
+            try:
+                reg_deadline = datetime.fromisoformat(reg_deadline.replace('Z', '+00:00'))
+            except:
+                reg_deadline = None
+        
+        # Save drive
+        drive = db_service.upsert_placement_drive(
+            db=db,
+            company_name=validated.get("company_name"),
+            source_email_id=email.id,
+            company_logo=validated.get("company_logo"),
+            role=validated.get("role"),
+            drive_type=validated.get("drive_type"),
+            batch=validated.get("batch"),
+            drive_date=drive_date,
+            registration_deadline=reg_deadline,
+            eligible_branches=validated.get("eligible_branches"),
+            min_cgpa=validated.get("min_cgpa"),
+            eligibility_text=validated.get("eligibility_text"),
+            ctc_or_stipend=validated.get("ctc_or_stipend"),
+            job_location=validated.get("job_location"),
+            registration_link=validated.get("registration_link"),
+            status=validated.get("status", "upcoming"),
+            confidence_score=validated.get("confidence_score", 0.5),
+            official_source=validated.get("official_source", "TPO Email")
+        )
+        
+        return {
+            "status": "saved",
+            "saved_email_id": email.id,
+            "saved_drive_id": drive.id
+        }
+    except Exception as e:
+        return {"status": "failed", "error_message": f"DB save failed: {e}"}
+
+
+# ============ ROUTING ============
+
+def route_after_filter(state: PipelineState) -> str:
+    """Route after filter: exit early if filtered."""
+    return END if state.get("status") == "filtered" else "process_text"
+
+
+def route_after_dedup(state: PipelineState) -> str:
+    """Route after dedup: exit if duplicate or failed."""
+    status = state.get("status", "")
+    if status in ("duplicate", "failed"):
+        return END
+    return "save_to_db"
 
 
 # ============ BUILD PIPELINE ============
 
 def build_pipeline() -> StateGraph:
-    """Build and compile the LangGraph pipeline."""
+    """Build the streamlined LangGraph pipeline."""
     workflow = StateGraph(PipelineState)
     
-    # Add all nodes
+    # Add nodes
     workflow.add_node("filter_sender", filter_sender_node)
-    workflow.add_node("html_to_text", html_to_text_node)
-    workflow.add_node("remove_noise", remove_noise_node)
-    workflow.add_node("token_safety", token_safety_node)
-    workflow.add_node("extract_sections", extract_sections_node)
-    workflow.add_node("regex_extract", regex_extract_node)
-    workflow.add_node("gemini_enhance", gemini_enhance_node)
-    workflow.add_node("validation", validation_node)
+    workflow.add_node("process_text", process_text_node)
+    workflow.add_node("extract_validate", extract_and_validate_node)
     workflow.add_node("deduplication", deduplication_node)
-    workflow.add_node("map_to_model", map_to_model_node)
+    workflow.add_node("save_to_db", save_to_db_node)
     
-    # Linear flow
+    # Conditional routing
     workflow.add_edge(START, "filter_sender")
-    workflow.add_edge("filter_sender", "html_to_text")
-    workflow.add_edge("html_to_text", "remove_noise")
-    workflow.add_edge("remove_noise", "token_safety")
-    workflow.add_edge("token_safety", "extract_sections")
-    workflow.add_edge("extract_sections", "regex_extract")
-    workflow.add_edge("regex_extract", "gemini_enhance")
-    workflow.add_edge("gemini_enhance", "validation")
-    workflow.add_edge("validation", "deduplication")
-    workflow.add_edge("deduplication", "map_to_model")
-    workflow.add_edge("map_to_model", END)
+    workflow.add_conditional_edges("filter_sender", route_after_filter)
+    workflow.add_edge("process_text", "extract_validate")
+    workflow.add_edge("extract_validate", "deduplication")
+    workflow.add_conditional_edges("deduplication", route_after_dedup)
+    workflow.add_edge("save_to_db", END)
     
     return workflow.compile()
 
 
-# Compiled pipeline instance
+# Compiled pipeline singleton
 pipeline = build_pipeline()
 
 
@@ -405,56 +286,45 @@ def run_langgraph_pipeline(
     raw_body: str,
     existing_drives: List[Dict] = None,
     api_key: str = None,
-    use_gemini: bool = True
+    use_gemini: bool = True,
+    db: Session = None
 ) -> Dict[str, Any]:
-    """
-    Run the full LangGraph email processing pipeline.
-    
-    Returns the final state with all extracted fields.
-    """
-    if existing_drives is None:
-        existing_drives = []
-    
+    """Run the LangGraph email processing pipeline."""
     initial_state: PipelineState = {
         "email_id": email_id,
         "gmail_message_id": gmail_message_id,
         "sender": sender,
         "subject": subject,
         "raw_body": raw_body,
-        "is_allowed_sender": False,
-        "plain_text": "",
         "clean_text": "",
-        "trimmed_text": "",
         "excerpts": [],
-        "regex_data": {},
-        "gemini_data": {},
         "extracted_data": {},
-        "validated_data": {},
         "status": "pending",
-        "is_duplicate": False,
         "error_message": None,
         "api_key": api_key,
         "use_gemini": use_gemini,
-        "existing_drives": existing_drives,
+        "existing_drives": existing_drives or [],
+        "db": db,
+        "saved_email_id": None,
+        "saved_drive_id": None,
     }
     
-    final_state = pipeline.invoke(initial_state)
-    return final_state
+    return pipeline.invoke(initial_state)
 
 
 def pipeline_result_to_json(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert pipeline state to JSON for API response."""
+    """Convert pipeline state to JSON response."""
     return {
         "email_id": state.get("email_id"),
         "gmail_message_id": state.get("gmail_message_id"),
         "sender": state.get("sender"),
         "subject": state.get("subject"),
         "status": state.get("status"),
-        "is_duplicate": state.get("is_duplicate", False),
         "error_message": state.get("error_message"),
         "excerpts": state.get("excerpts", []),
         "extraction_method": state.get("extracted_data", {}).get("extraction_method", "regex"),
         "extracted_data": state.get("extracted_data", {}),
-        "validated_data": state.get("validated_data", {}),
-        "clean_text_preview": (state.get("clean_text", ""))[:500] + "..." if len(state.get("clean_text", "")) > 500 else state.get("clean_text", "")
+        "saved_email_id": state.get("saved_email_id"),
+        "saved_drive_id": state.get("saved_drive_id"),
+        "clean_text_preview": (state.get("clean_text", "") or "")[:500]
     }

@@ -89,37 +89,64 @@ erDiagram
     }
 ```
 
-### 🧠 Intelligence Pipeline (LangGraph)
+### 🧠 LangGraph Pipeline (The Core)
 
-The system uses a 10-step **LangGraph** pipeline to transform raw emails into structured data.
+The system uses **LangGraph** (by LangChain) for stateful, graph-based orchestration. This is like a smart state machine that processes emails step-by-step with **conditional routing**.
 
 ```mermaid
-graph TD
-    Start([Input]) --> Filter
-    Filter --> Clean
-    Clean --> Noise
-    Noise --> Token
-    Token --> Sections
-    Sections --> Regex
-    Regex --> AI
-    AI --> Validate
-    Validate --> Dedup
-    Dedup --> Map
-    Map --> End([Output])
+graph LR
+    subgraph "🔍 Filtering"
+        A[📧 Email Input] --> B{Filter Sender}
+        B -->|❌ Not TPO| X[🚫 END]
+        B -->|✅ TPO Email| C[Process Text]
+    end
+    
+    subgraph "🧹 Processing"
+        C --> D[Extract & Validate]
+    end
+    
+    subgraph "💾 Storage"
+        D --> E{Duplicate?}
+        E -->|Yes| X
+        E -->|No| F[Save to DB]
+        F --> G[✅ Done]
+    end
 ```
 
-| Node | Function | How it works |
-|:---|:---|:---|
-| **1. filter_sender** | Security Gate | • Checks sender against `ALLOWED_SENDERS` (TPO emails).<br>• Scans subject for keywords (Drive, Hiring, Intern). |
-| **2. html_to_text** | Normalization | • Uses `BeautifulSoup` to strip HTML tags.<br>• Preserves line breaks for structure. |
-| **3. remove_noise** | Scrubber | • Cuts email signatures, "Forwarded message" headers, and legal disclaimers using Regex markers. |
-| **4. token_safety** | Constraint | • Truncates body to ~12k chars (~3k tokens) to ensure it fits within Gemini's context window. |
-| **5. extract_sections**| Segmentation| • Heuristic search for "Eligibility", "Process", "Dates" headers to focus extraction. |
-| **6. regex_extract** | Pattern Matching| • Runs 20+ regex patterns for Batch (e.g., `202[4-6]`), CTC (`\d+\.?\d* LPA`), and Roles. |
-| **7. gemini_enhance** | AI Intelligence | • Sends cleaned text + regex hints to **Gemini 1.5 Flash**.<br>• Fills gaps (e.g., implied roles, complex eligibility). |
-| **8. validation** | Data Integrity | • Standardizes dates to `YYYY-MM-DD`.<br>• Ensures strings like "8 LPA" become floats like `8.0`. |
-| **9. deduplication** | Conflict Check | • Fuzzy matches `(Company, Batch, Role)` against the DB.<br>• Prevents duplicate entries for the same drive. |
-| **10. map_to_model** | Formatting | • Maps the validated dictionary to the SQLAlchemy `PlacementDrive` schema fields. |
+#### Why LangGraph?
+
+| Feature | Traditional Code | LangGraph |
+|---------|------------------|-----------|
+| **Control Flow** | Nested if-else | Visual graph with conditional edges |
+| **Error Handling** | Try-catch everywhere | Built-in state recovery |
+| **Early Exit** | Manual returns | `add_conditional_edges()` |
+| **Debugging** | Print statements | Graph visualization |
+
+#### Node Breakdown
+
+| Node | Purpose | Key Tech |
+|:-----|:--------|:---------|
+| **1. Filter Sender** | Security gate - only TPO emails pass | Regex, keyword matching |
+| **2. Process Text** | HTML→Text, remove noise, extract dates/URLs | BeautifulSoup, Regex |
+| **3. Extract & Validate** | Get company, role, CTC using Regex + Gemini AI | Regex patterns + Gemini 1.5 Flash |
+| **4. Check Duplicate** | Fuzzy match against existing DB records | String similarity |
+| **5. Save to DB** | Upsert placement drive with smart conflict resolution | SQLAlchemy upsert |
+
+#### Example Flow
+
+```
+Input: "Flipkart Campus Drive || 2026 Batch || SDE Role"
+       ↓
+[Filter] ✅ From @iiit-bh.ac.in + has "campus drive"
+       ↓
+[Process] → Clean HTML, extract "2026", "SDE", URLs
+       ↓
+[Extract] → Regex: company="Flipkart", Gemini: CTC="24 LPA"
+       ↓
+[Dedup] ✅ New drive (not in DB)
+       ↓
+[Save] → INSERT PlacementDrive(company="Flipkart", batch="2026", role="SDE")
+```
 
 ---
 
@@ -203,13 +230,25 @@ graph TD
 ```bash
 PlacementPipeline/
 ├── app/
-│   ├── api/          # Route handlers (Endpoints)
-│   ├── models/       # SQLAlchemy Database Models
-│   ├── services/     # Business Logic (Gmail, Extraction, DB)
-│   └── database.py   # DB Connection
-├── main.py           # App Entrypoint
-├── Dockerfile        # Container Config
-└── requirements.txt  # Python Dependencies
+│   ├── api/v1/endpoints/  # FastAPI route handlers
+│   ├── models/            # SQLAlchemy models (Email, PlacementDrive)
+│   ├── services/          # Business logic
+│   │   ├── langgraph_pipeline.py  # Core LangGraph pipeline
+│   │   ├── gmail_service.py       # Gmail API integration
+│   │   ├── regex_extractor.py     # Pattern matching
+│   │   ├── gemini_extractor.py    # AI extraction
+│   │   ├── text_cleaner.py        # HTML/noise processing
+│   │   └── db_service.py          # Database operations
+│   └── database.py
+├── tests/                 # Test suite
+│   └── test_endpoints.py
+├── .github/workflows/     # CI/CD pipelines
+├── main.py                # App entrypoint
+├── pyproject.toml         # Python project config
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+└── README.md
 ```
 
 ---

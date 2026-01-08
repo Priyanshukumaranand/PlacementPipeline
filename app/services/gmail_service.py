@@ -18,11 +18,13 @@ def get_gmail_service():
     On first run, opens browser for OAuth authentication and saves token.
     Subsequent runs use cached token with automatic refresh if expired.
     """
+    creds_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+    token_file = os.getenv("GOOGLE_TOKEN_FILE", "token.json")
     creds = None
 
     # Load existing token if available
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
 
     # If no valid credentials, authenticate
     if not creds or not creds.valid:
@@ -32,12 +34,12 @@ def get_gmail_service():
         else:
             # Run OAuth flow (opens browser)
             flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json", SCOPES
+                creds_file, SCOPES
             )
             creds = flow.run_local_server(port=0)
 
         # Save credentials for next run
-        with open("token.json", "w") as token:
+        with open(token_file, "w") as token:
             token.write(creds.to_json())
 
     # Build and return Gmail service
